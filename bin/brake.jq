@@ -16,12 +16,12 @@
 def fmt: if type != "number" then "?" elif . == floor then tostring else (. * 10 | round / 10 | tostring) end;
 def wname: if . == "five_hour" then "5-hour" else "weekly" end;
 def ago: if . < 90 then "\(. | floor)s" elif . < 5400 then "\(. / 60 | floor)m" else "\(. / 3600 | floor)h" end;
-def until_: (. - $now) as $s
+def until_: ((. // $now) - $now) as $s
   | if $s <= 0 then "now"
     elif $s < 3600 then "in \($s / 60 | floor)m"
     elif $s < 86400 then "in \($s / 3600 | floor)h \(($s % 3600) / 60 | floor)m"
     else "in \($s / 86400 | floor)d \(($s % 86400) / 3600 | floor)h" end;
-def when_: "\(localtime | strftime("%a %H:%M")) (\(until_))";
+def when_: if type != "number" then "unknown" else "\(localtime | strftime("%a %H:%M")) (\(until_))" end;
 
 # Readings are merged, not just "newest wins": an idle session's status line
 # keeps re-rendering its cached (older, lower) numbers with a new timestamp.
@@ -50,7 +50,10 @@ def evaluate:
     elif ($now - $u.ts) > $stale then {state: "stale", b: $b, u: $u, age: ($now - $u.ts)}
     else
       $u[$b.window] as $r
-      | if ($r | type) != "object" or ($r.pct | type) != "number" then {state: "nowindow", b: $b, u: $u, age: ($now - $u.ts)}
+      | if ($r | type) != "object" or ($r.pct | type) != "number" then
+          if ($b.resets_at | type) == "number" and $b.resets_at <= $now
+          then {state: "ok", b: $b, u: $u, age: ($now - $u.ts), between_windows: true}
+          else {state: "nowindow", b: $b, u: $u, age: ($now - $u.ts)} end
         else
           ($b
             # armed before any reading existed: take the first one as baseline
@@ -113,6 +116,7 @@ def status_text:
                 (if $e.b.budget != null then "  budget \($e.b.budget | fmt) points" else empty end),
                 (if $e.b.max != null then "  ceiling \($e.b.max | fmt)%" else empty end),
                 (if $e.state == "nodata" then "  No usage reading yet. If this persists, check that the usage-brake status line is installed."
+                 elif $e.between_windows then "  The window just reset; waiting for the next usage reading."
                  else "  " + reason($e) end) ]
             end)
          + ["/limit off disarms it."])
@@ -132,7 +136,8 @@ elif $mode == "status" then status_text
 elif $mode == "line" then
   # compact indicator appended to the status line while armed
   evaluate as $e
-  | if $e.state == "ok" then
+  | if $e.between_windows then "brake: window reset, waiting for a reading"
+    elif $e.state == "ok" then
       "brake " + ([ (if $e.b.budget != null then "\($e.used | fmt)/\($e.b.budget | fmt) pts" else empty end),
                     (if $e.b.max != null then "max \($e.b.max | fmt)%" else empty end) ] | join(" · "))
     elif $e.state == "limit" or $e.state == "ceiling" then "brake: limit reached, tools refused"

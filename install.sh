@@ -19,6 +19,7 @@ SKILL="$C/skills/limit"
 WRAP="$D/bin/statusline.sh"
 HOOK="$D/bin/pretooluse.sh"
 MARK="usage-brake/bin/"   # identifies our entries in settings.json
+SKILL_MARK="claude-usage-brake"   # identifies our SKILL.md
 
 mode=install
 case "${1:-}" in
@@ -32,6 +33,9 @@ esac
 die() { echo "error: $*" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || die "jq is required (macOS: brew install jq; Debian/Ubuntu: apt install jq)."
 
+case "$C" in *"'"*) die "config dir path contains a single quote: $C" ;; esac
+q() { printf "'%s'" "$1"; }   # quote a path for a settings.json command
+
 if [ -f "$S" ]; then
   jq -e 'type == "object"' "$S" >/dev/null 2>&1 || die "$S is not a plain JSON object (comments?). Not touching it."
   cur=$(cat "$S")
@@ -39,6 +43,7 @@ else
   cur='{}'
 fi
 
+perms() { if stat -c %a "$1" >/dev/null 2>&1; then stat -c %a "$1"; else stat -f %Lp "$1"; fi; }
 write_settings() { # new-json
   local new=$1
   if [ "$new" = "$cur" ]; then echo "settings.json: no change needed"; return; fi
@@ -48,16 +53,29 @@ write_settings() { # new-json
     echo "settings.json: backed up to $bak"
   fi
   mkdir -p "$C"
-  local tmp; tmp=$(mktemp "$C/.settings.json.XXXXXX")
-  printf '%s\n' "$new" >"$tmp"
-  [ -f "$S" ] && chmod "$(perms "$S")" "$tmp" 2>/dev/null || true
-  mv -f "$tmp" "$S"
+  if [ -L "$S" ]; then
+    # symlinked (dotfile manager): write through the link, keep it a link
+    printf '%s\n' "$new" >"$S"
+  else
+    local tmp; tmp=$(mktemp "$C/.settings.json.XXXXXX")
+    printf '%s\n' "$new" >"$tmp"
+    if [ -f "$S" ]; then chmod "$(perms "$S")" "$tmp" 2>/dev/null || true; fi
+    mv -f "$tmp" "$S"
+  fi
   echo "settings.json: updated"
 }
-perms() { if stat -c %a "$1" >/dev/null 2>&1; then stat -c %a "$1"; else stat -f %Lp "$1"; fi; }
 
-# Is the current status line ours already?
-ours=$(jq -r --arg m "$MARK" '(.statusLine.command // "") | contains($m)' <<<"$cur")
+# jq: drop our hook commands; drop an entry only if it held ours and is now empty.
+STRIP='def strip($m):
+  map(if type == "object" and (.hooks | type) == "array"
+          and any(.hooks[]; (.command? // "") | tostring | contains($m))
+      then .hooks |= map(select((.command? // "") | tostring | contains($m) | not))
+           | select(.hooks | length > 0)
+      else . end);'
+
+ours=$(jq -r --arg m "$MARK" '(.statusLine | if type == "object" then (.command // "") else "" end) | tostring | contains($m)' <<<"$cur")
+
+our_skill() { [ -f "$SKILL/SKILL.md" ] && grep -q "$SKILL_MARK" "$SKILL/SKILL.md"; }
 
 if [ "$mode" = uninstall ]; then
   new="$cur"
@@ -73,28 +91,42 @@ if [ "$mode" = uninstall ]; then
   else
     echo "status line: not ours, leaving it alone"
   fi
-  new=$(jq --arg m "$MARK" '
-    if .hooks.PreToolUse then
-      .hooks.PreToolUse |= map(.hooks |= map(select((.command // "") | contains($m) | not)) | select(.hooks | length > 0))
+  new=$(jq --arg m "$MARK" "$STRIP"'
+    if (.hooks | type) == "object" and (.hooks.PreToolUse | type) == "array" then
+      .hooks.PreToolUse |= strip($m)
       | if (.hooks.PreToolUse | length) == 0 then del(.hooks.PreToolUse) else . end
       | if (.hooks | length) == 0 then del(.hooks) else . end
     else . end' <<<"$new")
   write_settings "$new"
-  rm -rf "$SKILL" "$D"
-  echo "removed $SKILL and $D"
-  echo "Done. Open sessions keep the old status line until restarted."
+  if our_skill; then
+    rm -f "$SKILL/SKILL.md" "$SKILL/limit.sh"; rmdir "$SKILL" 2>/dev/null || true
+    echo "removed $SKILL"
+  fi
+  rm -rf "$D"
+  echo "removed $D"
+  echo "Done. settings.json backups (settings.json.usage-brake-backup.*) are left in $C."
+  echo "Open sessions keep the old status line until it next refreshes or they restart."
   exit 0
 fi
 
 # ---- install / update ----
+if [ -e "$SKILL" ] && ! our_skill; then
+  die "$SKILL already exists and isn't ours. Move it aside and re-run."
+fi
+
 if [ "$ours" = true ]; then
-  orig_sl=$(cat "$D/orig-statusline.json" 2>/dev/null || echo null)
+  if [ -f "$D/orig-statusline.json" ]; then
+    orig_sl=$(cat "$D/orig-statusline.json")
+  else
+    echo "warning: settings point at the usage-brake wrapper but the original status line record is gone; treating it as none." >&2
+    orig_sl=null
+  fi
 else
-  orig_sl=$(jq -c '.statusLine // null' <<<"$cur")
+  orig_sl=$(jq -c '.statusLine | if type == "object" then . else null end' <<<"$cur")
 fi
 orig_cmd=$(jq -r 'if type == "object" then .command // "" else "" end' <<<"$orig_sl")
 
-new=$(jq --arg w "$WRAP" --arg h "$HOOK" --arg m "$MARK" --argjson o "$orig_sl" '
+new=$(jq --arg w "$(q "$WRAP")" --arg h "$(q "$HOOK")" --arg m "$MARK" --argjson o "$orig_sl" "$STRIP"'
   # status line: keep your options (padding etc.), swap in the wrapper,
   # and re-run it every 60 s if you had no refreshInterval, so an armed
   # brake never mistakes an idle session for a broken status line.
@@ -102,9 +134,9 @@ new=$(jq --arg w "$WRAP" --arg h "$HOOK" --arg m "$MARK" --argjson o "$orig_sl" 
                  + {type: "command", command: $w}
                  | if .refreshInterval == null then .refreshInterval = 60 else . end)
   # PreToolUse hook, once
-  | .hooks = (.hooks // {})
-  | .hooks.PreToolUse = ((.hooks.PreToolUse // [])
-      | map(.hooks |= map(select((.command // "") | contains($m) | not)) | select(.hooks | length > 0))
+  | .hooks = (if (.hooks | type) == "object" then .hooks else {} end)
+  | .hooks.PreToolUse = ((if (.hooks.PreToolUse | type) == "array" then .hooks.PreToolUse else [] end)
+      | strip($m)
       + [{matcher: "*", hooks: [{type: "command", command: $h, timeout: 10}]}])
 ' <<<"$cur")
 

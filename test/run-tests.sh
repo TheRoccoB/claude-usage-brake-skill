@@ -36,7 +36,7 @@ limit() { "$CLAUDE_CONFIG_DIR/skills/limit/limit.sh" "$@"; }
 echo "install"
 "$ROOT/install.sh" >/dev/null || bad "install exit code"
 S="$CLAUDE_CONFIG_DIR/settings.json"
-check "status line wrapped" '[ "$(jq -r .statusLine.command "$S")" = "$D/bin/statusline.sh" ]'
+check "status line wrapped" '[ "$(jq -r .statusLine.command "$S")" = "'"'"'$D/bin/statusline.sh'"'"'" ]'
 check "padding kept" '[ "$(jq -r .statusLine.padding "$S")" = 2 ]'
 check "refreshInterval added" '[ "$(jq -r .statusLine.refreshInterval "$S")" = 60 ]'
 check "other settings kept" '[ "$(jq -r .theme "$S")" = dark ] && [ "$(jq -r ".hooks.SessionStart[0].hooks[0].command" "$S")" = "echo hi" ]'
@@ -125,6 +125,17 @@ limit "$SID" 10 --5h >/dev/null
 check "--5h selects 5-hour" '[ "$(jq -r .window "$D/budget/$SID.json")" = five_hour ]'
 limit "$SID" off >/dev/null
 
+echo "window just reset, no new reading yet"
+rm -f "$D/usage/"*.json
+sl "$SID" 40 >/dev/null
+limit "$SID" 5 >/dev/null
+jq --argjson p $((now - 10)) '.resets_at = $p' "$D/budget/$SID.json" >"$T/b" && mv "$T/b" "$D/budget/$SID.json"
+for f in "$D/usage/$SID.json" "$D/usage/latest.json"; do jq --argjson p $((now - 10)) '.seven_day.resets_at = $p' "$f" >"$T/u" && mv "$T/u" "$f"; done
+check "allows between windows instead of a false deny" '[ -z "$(hook "$SID")" ]'
+check "status explains it" 'limit "$SID" | grep -q "window just reset"'
+limit "$SID" off >/dev/null
+check "off is not undone by a late hook write" '[ -z "$(hook "$SID")" ] && [ ! -f "$D/budget/$SID.json" ]'
+
 echo "argument handling"
 check "bad arg -> usage" 'limit "$SID" banana | grep -q Usage'
 check "zero budget refused" 'limit "$SID" 0 | grep -q "more than 0"'
@@ -150,6 +161,38 @@ out=$(sl "$SID" 22)
 check "works without original status line" '[ -z "$out" ]' "$out"
 "$ROOT/install.sh" --uninstall >/dev/null
 check "uninstall leaves no statusLine or hooks" '[ "$(jq -c "{statusLine,hooks}" "$S")" = "{\"statusLine\":null,\"hooks\":null}" ]' "$(cat "$S")"
+
+echo "odd settings shapes"
+printf '{"statusLine":"weird","hooks":{"PreToolUse":[{"matcher":"Bash"},{"matcher":"Edit","hooks":[]},{"matcher":"*","hooks":[{"type":"command","command":"keep-me"}]}]}}\n' >"$S"
+cp "$S" "$T/odd.json"
+check "installs over odd shapes" '"$ROOT/install.sh" >/dev/null 2>&1'
+check "keeps entries it does not own" '[ "$(jq ".hooks.PreToolUse | length" "$S")" = 4 ]' "$(jq -c .hooks "$S")"
+"$ROOT/install.sh" --uninstall >/dev/null 2>&1
+check "uninstall restores odd shapes (minus the non-object status line)" '[ "$(jq -c .hooks "$S")" = "$(jq -c .hooks "$T/odd.json")" ]' "$(jq -c .hooks "$S")"
+
+echo "symlinked settings.json"
+mkdir -p "$T/dotfiles"; printf '{"theme":"light"}\n' >"$T/dotfiles/settings.json"
+rm -f "$S"; ln -s "$T/dotfiles/settings.json" "$S"
+"$ROOT/install.sh" >/dev/null
+check "settings.json is still a symlink" '[ -L "$S" ] && jq -e .statusLine "$T/dotfiles/settings.json" >/dev/null'
+"$ROOT/install.sh" --uninstall >/dev/null
+check "still a symlink after uninstall" '[ -L "$S" ] && [ "$(jq -c . "$T/dotfiles/settings.json")" = "{\"theme\":\"light\"}" ]'
+
+echo "foreign limit skill"
+mkdir -p "$CLAUDE_CONFIG_DIR/skills/limit"; echo "my own skill" >"$CLAUDE_CONFIG_DIR/skills/limit/SKILL.md"
+check "refuses to overwrite someone else's /limit" '! "$ROOT/install.sh" >/dev/null 2>&1 && grep -q "my own" "$CLAUDE_CONFIG_DIR/skills/limit/SKILL.md"'
+rm -rf "$CLAUDE_CONFIG_DIR/skills/limit"
+
+echo "config dir with a space"
+export CLAUDE_CONFIG_DIR="$T/My Config"; mkdir -p "$CLAUDE_CONFIG_DIR"
+D="$CLAUDE_CONFIG_DIR/usage-brake"; S="$CLAUDE_CONFIG_DIR/settings.json"
+"$ROOT/install.sh" >/dev/null
+cmd=$(jq -r .statusLine.command "$S")
+out=$(printf '{"session_id":"%s","rate_limits":{"seven_day":{"used_percentage":5,"resets_at":%s}}}' "$SID" "$reset7" | bash -c "$cmd"; echo "rc=$?")
+check "quoted status line command runs" '[ "$out" = "rc=0" ] && [ -f "$D/usage/$SID.json" ]' "$out"
+hcmd=$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$S")
+"$CLAUDE_CONFIG_DIR/skills/limit/limit.sh" "$SID" --max 5 >/dev/null
+check "quoted hook command runs and denies" 'printf "{\"session_id\":\"%s\",\"tool_name\":\"Bash\"}" "$SID" | bash -c "$hcmd" | grep -q deny'
 
 echo
 echo "$pass passed, $fail failed"

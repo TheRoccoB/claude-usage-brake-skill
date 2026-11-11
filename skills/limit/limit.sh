@@ -31,8 +31,16 @@ run_jq() { # mode argjson
     -f "$J"
 }
 
-# Housekeeping: drop state from sessions idle for over 8 days.
-find "$D/budget" "$D/usage" -type f -name '*.json' ! -name latest.json -mtime +8 -exec rm -f {} + 2>/dev/null
+# Housekeeping: drop usage readings untouched for 8 days, and budgets whose
+# session's status line has not run for 2 days (the session is gone; an open
+# session refreshes its reading every minute).
+find "$D/usage" -type f -name '*.json' ! -name latest.json -mtime +8 -exec rm -f {} + 2>/dev/null
+for f in "$D"/budget/*.json; do
+  [ -f "$f" ] || continue
+  s=$(basename "$f" .json)
+  [ "$s" = "$sid" ] && continue
+  if [ -z "$(find "$D/usage/$s.json" -mtime -2 2>/dev/null)" ] && [ -n "$(find "$f" -mtime +2 2>/dev/null)" ]; then rm -f "$f"; fi
+done
 
 budget=null; max=null; window=null; action=status
 while [ $# -gt 0 ]; do

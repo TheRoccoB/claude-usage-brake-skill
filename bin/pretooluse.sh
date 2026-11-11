@@ -34,7 +34,8 @@ out=$(jq -rn \
 IFS=$'\t' read -r decision newb hookjson <<<"$out"
 
 if [ "$newb" != "-" ] && [ -n "$newb" ]; then
-  tmp=$(mktemp "$D/budget/.tmp.XXXXXX") && printf '%s\n' "$newb" >"$tmp" && mv -f "$tmp" "$bf"
+  tmp=$(mktemp "$D/budget/.tmp.XXXXXX") && printf '%s\n' "$newb" >"$tmp" \
+    && { [ -f "$bf" ] && mv -f "$tmp" "$bf" || rm -f "$tmp"; }
 fi
 
 if [ "$decision" = "allow" ]; then exit 0; fi
